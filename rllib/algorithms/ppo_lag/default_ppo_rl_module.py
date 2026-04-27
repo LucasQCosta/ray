@@ -42,6 +42,7 @@ class DefaultPPORLModule(RLModule, InferenceOnlyAPI, ValueFunctionAPI, abc.ABC):
         self.encoder = self.catalog.build_actor_critic_encoder(framework=self.framework)
         self.pi = self.catalog.build_pi_head(framework=self.framework)
         self.vf = self.catalog.build_vf_head(framework=self.framework)
+        self.cost_vf = self.catalog.build_cost_vf_head(framework=self.framework)
         # __sphinx_doc_end__
 
     @override(RLModule)
