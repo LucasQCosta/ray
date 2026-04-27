@@ -197,5 +197,15 @@ class PPOCatalog(Catalog):
         """
         return self.vf_head_config.build(framework=framework)
 
+    def build_cost_vf_head(self, framework: str):
+        """Build the value function head for the cost function.
+       
+        Args:
+            framework: The framework to use. Either "torch" or "tf2".
+
+        Returns:
+            The value cost function head.
+        """
+        return self.cost_vf_head_config.build(framework=framework)
 
 # __sphinx_doc_end__
