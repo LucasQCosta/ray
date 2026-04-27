@@ -1,3 +1,11 @@
+# Lucas Enviroment
+ray_env/
+
+# Temporary Scripts
+test.py
+
+#-----------------------------------------------
+
 # The build output should clearly not be checked in
 *test-output.xml
 /bazel-*
