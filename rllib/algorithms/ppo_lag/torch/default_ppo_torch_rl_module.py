@@ -71,3 +71,25 @@ class DefaultPPOTorchRLModule(TorchRLModule, DefaultPPORLModule):
         vf_out = self.vf(embeddings)
         # Squeeze out last dimension (single node value head).
         return vf_out.squeeze(-1)
+    
+    def get_lambda(self) -> TensorType:
+        return self.softplus(self.lambda_param)
+
+    def compute_cost_values(
+        self,
+        batch: Dict[str, Any],
+        embeddings: Optional[Any] = None,
+    ) -> TensorType:
+        if embeddings is None:
+            if hasattr(self.encoder, "critic_encoder"):
+                batch_ = batch
+                if self.is_stateful():
+                    batch_ = batch.copy()
+                    batch_[Columns.STATE_IN] = batch[Columns.STATE_IN][CRITIC]
+                embeddings = self.encoder.critic_encoder(batch_)[ENCODER_OUT]
+            else:
+                embeddings = self.encoder(batch)[ENCODER_OUT][CRITIC]
+
+        cost_vf_out = self.cost_vf(embeddings)
+        
+        return cost_vf_out.squeeze(-1)

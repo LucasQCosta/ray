@@ -9,6 +9,7 @@ from ray.rllib.algorithms.ppo.ppo import (
 from ray.rllib.connectors.learner import (
     AddOneTsToEpisodesAndTruncate,
     GeneralAdvantageEstimation,
+    CostGeneralAdvantageEstimation
 )
 from ray.rllib.core.learner.learner import Learner
 from ray.rllib.core.rl_module.apis.value_function_api import ValueFunctionAPI
@@ -71,6 +72,13 @@ class PPOLearner(Learner):
             self._learner_connector.append(
                 GeneralAdvantageEstimation(
                     gamma=self.config.gamma, lambda_=self.config.lambda_
+                )
+            )
+
+            self._learner_connector.append(
+                CostGeneralAdvantageEstimation(
+                    gamma=getattr(self.config, "cost_gamma", self.config.gamma),
+                    lambda_=getattr(self.config, "cost_lambda", self.config.lambda_)
                 )
             )
 

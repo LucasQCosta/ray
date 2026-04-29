@@ -10,6 +10,9 @@ from ray.rllib.utils.annotations import (
 )
 from ray.util.annotations import DeveloperAPI
 
+import torch
+import torch.nn as nn
+
 
 @DeveloperAPI
 class DefaultPPORLModule(RLModule, InferenceOnlyAPI, ValueFunctionAPI, abc.ABC):
@@ -45,6 +48,14 @@ class DefaultPPORLModule(RLModule, InferenceOnlyAPI, ValueFunctionAPI, abc.ABC):
         self.cost_vf = self.catalog.build_cost_vf_head(framework=self.framework)
         # __sphinx_doc_end__
 
+        # Build a lagrangian Catalog
+        self.lambda_param = nn.Parameter(
+            torch.tensor(0.0, dtype=torch.float32), 
+            requires_grad=True
+        )
+        # Avoid negative lambda values by applying a softplus transformation        
+        self.softplus = nn.Softplus()
+
     @override(RLModule)
     def get_initial_state(self) -> dict:
         if hasattr(self.encoder, "get_initial_state"):
@@ -56,7 +67,7 @@ class DefaultPPORLModule(RLModule, InferenceOnlyAPI, ValueFunctionAPI, abc.ABC):
     @override(InferenceOnlyAPI)
     def get_non_inference_attributes(self) -> List[str]:
         """Return attributes, which are NOT inference-only (only used for training)."""
-        return ["vf"] + (
+        return ["vf" , "cost_vf", "lambda_param", "softplus"] + (
             []
             if self.model_config.get("vf_share_layers")
             else ["encoder.critic_encoder"]

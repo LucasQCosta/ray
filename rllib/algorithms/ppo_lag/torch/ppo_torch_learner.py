@@ -30,6 +30,25 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
 
     This class implements the ppo loss under `self.compute_loss_for_module()`.
     """
+    @override(TorchLearner)
+    def configure_optimizers_for_module(
+        self, module_id: ModuleID, config: PPOConfig
+    ) -> None:
+        super().configure_optimizers_for_module(module_id, config)
+        
+        module = self.module[module_id].unwrapped()
+        
+        lambda_lr = getattr(config, "lambda_lr", 0.05) 
+        
+        lambda_optimizer = torch.optim.Adam([module.lambda_param], lr=lambda_lr)
+        
+        self.register_optimizer(
+            module_id=module_id,
+            optimizer_name="lambda_optimizer",
+            optimizer=lambda_optimizer,
+            params=[module.lambda_param],
+        )
+
 
     @override(TorchLearner)
     def compute_loss_for_module(
@@ -56,6 +75,16 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
 
         else:
             possibly_masked_mean = torch.mean
+
+        current_lambda = module.get_lambda()
+        
+        if "cost_advantages" in batch:
+            adv_r = batch[Postprocessing.ADVANTAGES]
+            adv_c = batch["cost_advantages"]
+            
+            lambda_detached = current_lambda.detach()
+            
+            batch[Postprocessing.ADVANTAGES] = (adv_r - lambda_detached * adv_c) / (1.0 + lambda_detached)
 
         action_dist_class_train = module.get_train_action_dist_cls()
         action_dist_class_exploration = module.get_exploration_action_dist_cls()
@@ -100,6 +129,14 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
             vf_loss_clipped = torch.clamp(vf_loss, 0, config.vf_clip_param)
             mean_vf_loss = possibly_masked_mean(vf_loss_clipped)
             mean_vf_unclipped_loss = possibly_masked_mean(vf_loss)
+            if "cost_value_targets" in batch:
+                cost_fn_out = module.compute_cost_values(
+                    batch, embeddings=fwd_out.get(Columns.EMBEDDINGS)
+                )
+                cost_vf_loss = torch.pow(cost_fn_out - batch["cost_value_targets"], 2.0)
+                mean_cost_vf_loss = possibly_masked_mean(cost_vf_loss)
+                
+                total_loss = total_loss + config.vf_loss_coeff * mean_cost_vf_loss
         # Ignore the value function -> Set all to 0.0.
         else:
             z = torch.tensor(0.0, device=surrogate_loss.device)
@@ -118,6 +155,17 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
         # if necessary.
         if config.use_kl_loss:
             total_loss += self.curr_kl_coeffs_per_module[module_id] * mean_kl_loss
+
+        if "costs" in batch:
+            mean_cost = possibly_masked_mean(batch["costs"])
+            cost_limit = getattr(config, "cost_limit", 25.0)
+            
+            lambda_loss = -current_lambda * (mean_cost - cost_limit)
+            
+            total_loss = total_loss + lambda_loss
+            
+            self.metrics.log_value((module_id, "mean_cost"), mean_cost.item(), window=1)
+            self.metrics.log_value((module_id, "lambda_value"), current_lambda.item(), window=1)
 
         # Log important loss stats.
         self.metrics.log_dict(
