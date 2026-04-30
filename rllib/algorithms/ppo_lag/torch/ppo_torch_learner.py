@@ -10,7 +10,7 @@ from ray.rllib.algorithms.ppo.ppo import (
     LEARNER_RESULTS_VF_LOSS_UNCLIPPED_KEY,
     PPOConfig,
 )
-from ray.rllib.algorithms.ppo.ppo_learner import PPOLearner
+from ray.rllib.algorithms.ppo_lag.ppo_learner import PPOLearner
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.learner.learner import ENTROPY_KEY, POLICY_LOSS_KEY, VF_LOSS_KEY
 from ray.rllib.core.learner.torch.torch_learner import TorchLearner
@@ -34,19 +34,31 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
     def configure_optimizers_for_module(
         self, module_id: ModuleID, config: PPOConfig
     ) -> None:
-        super().configure_optimizers_for_module(module_id, config)
-        
-        module = self.module[module_id].unwrapped()
-        
-        lambda_lr = getattr(config, "lambda_lr", 0.05) 
-        
-        lambda_optimizer = torch.optim.Adam([module.lambda_param], lr=lambda_lr)
-        
+        # Register the default optimizer for all module parameters EXCEPT the
+        # Lagrangian multiplier parameter. We keep lambda updates separate.
+        module = self._module[module_id]
+        params = [
+            p
+            for (name, p) in module.named_parameters()
+            if name != "lambda_param"
+        ]
+        optimizer = torch.optim.Adam(params)
+        self.register_optimizer(
+            module_id=module_id,
+            optimizer=optimizer,
+            params=params,
+            lr_or_lr_schedule=config.lr,
+        )
+
+        lag_module = self.module[module_id].unwrapped()
+        lambda_lr = getattr(config, "lambda_lr", 0.05)
+        lambda_optimizer = torch.optim.Adam([lag_module.lambda_param], lr=lambda_lr)
         self.register_optimizer(
             module_id=module_id,
             optimizer_name="lambda_optimizer",
             optimizer=lambda_optimizer,
-            params=[module.lambda_param],
+            params=[lag_module.lambda_param],
+            lr_or_lr_schedule=lambda_lr,
         )
 
 
@@ -133,14 +145,17 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
                 cost_fn_out = module.compute_cost_values(
                     batch, embeddings=fwd_out.get(Columns.EMBEDDINGS)
                 )
-                cost_vf_loss = torch.pow(cost_fn_out - batch["cost_value_targets"], 2.0)
+                cost_vf_loss = torch.pow(
+                    cost_fn_out - batch["cost_value_targets"], 2.0
+                )
                 mean_cost_vf_loss = possibly_masked_mean(cost_vf_loss)
-                
-                total_loss = total_loss + config.vf_loss_coeff * mean_cost_vf_loss
+            else:
+                mean_cost_vf_loss = torch.tensor(0.0, device=value_fn_out.device)
         # Ignore the value function -> Set all to 0.0.
         else:
             z = torch.tensor(0.0, device=surrogate_loss.device)
             value_fn_out = mean_vf_unclipped_loss = vf_loss_clipped = mean_vf_loss = z
+            mean_cost_vf_loss = z
 
         total_loss = possibly_masked_mean(
             -surrogate_loss
@@ -150,6 +165,10 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
                 * curr_entropy
             )
         )
+
+        # Add cost value function loss, if available.
+        if mean_cost_vf_loss is not None:
+            total_loss = total_loss + config.vf_loss_coeff * mean_cost_vf_loss
 
         # Add mean_kl_loss (already processed through `possibly_masked_mean`),
         # if necessary.
