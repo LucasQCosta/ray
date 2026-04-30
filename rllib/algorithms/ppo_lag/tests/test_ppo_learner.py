@@ -1,42 +1,17 @@
-import tempfile
 import unittest
 
 import gymnasium as gym
 import numpy as np
 
 import ray
-import ray.rllib.algorithms.ppo as ppo
-from ray.rllib.algorithms.ppo.ppo import LEARNER_RESULTS_CURR_KL_COEFF_KEY
+import ray.rllib.algorithms.ppo_lag as ppo_lag
+from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
-from ray.rllib.examples.envs.classes.multi_agent import MultiAgentCartPole
-from ray.rllib.utils.metrics import LEARNER_RESULTS
-from ray.rllib.utils.test_utils import check
-from ray.tune.registry import register_env
-
-# Fake CartPole episode of n time steps.
-FAKE_BATCH = {
-    Columns.OBS: np.array(
-        [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 1.0, 1.1, 1.2]],
-        dtype=np.float32,
-    ),
-    Columns.NEXT_OBS: np.array(
-        [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 1.0, 1.1, 1.2]],
-        dtype=np.float32,
-    ),
-    Columns.ACTIONS: np.array([0, 1, 1]),
-    Columns.REWARDS: np.array([1.0, -1.0, 0.5], dtype=np.float32),
-    Columns.TERMINATEDS: np.array([False, False, True]),
-    Columns.TRUNCATEDS: np.array([False, False, False]),
-    Columns.VF_PREDS: np.array([0.5, 0.6, 0.7], dtype=np.float32),
-    Columns.ACTION_DIST_INPUTS: np.array(
-        [[-2.0, 0.5], [-3.0, -0.3], [-0.1, 2.5]], dtype=np.float32
-    ),
-    Columns.ACTION_LOGP: np.array([-0.5, -0.1, -0.2], dtype=np.float32),
-    Columns.EPS_ID: np.array([0, 0, 0]),
-}
+from ray.rllib.evaluation.postprocessing import Postprocessing
+from ray.rllib.policy.sample_batch import MultiAgentBatch, SampleBatch
 
 
-class TestPPO(unittest.TestCase):
+class TestPPOLagLearner(unittest.TestCase):
     ENV = gym.make("CartPole-v1")
 
     @classmethod
@@ -47,91 +22,174 @@ class TestPPO(unittest.TestCase):
     def tearDownClass(cls):
         ray.shutdown()
 
-    def test_save_to_path_and_restore_from_path(self):
-        """Tests saving and loading the state of the PPO Learner Group."""
+    def _build_local_learner(self, *, add_default_connectors: bool):
         config = (
-            ppo.PPOConfig()
+            ppo_lag.PPOConfig()
+            .framework("torch")
             .environment("CartPole-v1")
-            .env_runners(
-                num_env_runners=0,
+            .env_runners(num_env_runners=0)
+            .api_stack(
+                enable_rl_module_and_learner=True,
+                enable_env_runner_and_connector_v2=True,
+            )
+            .learners(
+                num_learners=0,
+                add_default_connectors_to_learner_pipeline=add_default_connectors,
             )
             .training(
-                gamma=0.99,
-                model=dict(
-                    fcnet_hiddens=[10, 10],
-                    fcnet_activation="linear",
-                    vf_share_layers=False,
-                ),
+                # Keep the learner update fast.
+                num_epochs=1,
+                minibatch_size=None,
+                train_batch_size=32,
+                use_kl_loss=False,
             )
         )
-
         algo_config = config.copy(copy_frozen=False)
         algo_config.validate()
         algo_config.freeze()
-        learner_group1 = algo_config.build_learner_group(env=self.ENV)
-        learner_group2 = algo_config.build_learner_group(env=self.ENV)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            learner_group1.save_to_path(tmpdir)
-            learner_group2.restore_from_path(tmpdir)
-            # Remove functions from state b/c they are not comparable via `check`.
-            s1 = learner_group1.get_state()
-            s2 = learner_group2.get_state()
-            check(s1, s2)
+        learner_group = algo_config.build_learner_group(env=self.ENV)
+        return learner_group._learner
 
-    def test_kl_coeff_changes(self):
-        # Simple environment with 4 independent cartpole entities
-        register_env(
-            "multi_agent_cartpole", lambda _: MultiAgentCartPole({"num_agents": 2})
+    def _make_synthetic_mab(self, *, t: int, mean_cost: float) -> MultiAgentBatch:
+        obs = np.random.uniform(low=-1.0, high=1.0, size=(t, 4)).astype(np.float32)
+        next_obs = np.random.uniform(low=-1.0, high=1.0, size=(t, 4)).astype(
+            np.float32
+        )
+        actions = np.random.randint(low=0, high=2, size=(t,), dtype=np.int64)
+        rewards = np.random.uniform(low=-1.0, high=1.0, size=(t,)).astype(np.float32)
+        terminateds = np.zeros((t,), dtype=bool)
+        terminateds[-1] = True
+        truncateds = np.zeros((t,), dtype=bool)
+
+        action_dist_inputs = np.random.normal(size=(t, 2)).astype(np.float32)
+        action_logp = np.random.normal(loc=-0.5, scale=0.1, size=(t,)).astype(
+            np.float32
         )
 
-        initial_kl_coeff = 0.01
-        config = (
-            ppo.PPOConfig()
-            .environment("CartPole-v1")
-            .env_runners(
-                num_env_runners=0,
-                rollout_fragment_length=50,
-                exploration_config={},
-            )
-            .training(
-                gamma=0.99,
-                model=dict(
-                    fcnet_hiddens=[10, 10],
-                    fcnet_activation="linear",
-                    vf_share_layers=False,
-                ),
-                kl_coeff=initial_kl_coeff,
-            )
-            .environment("multi_agent_cartpole")
-            .multi_agent(
-                policies={"p0", "p1"},
-                policy_mapping_fn=lambda agent_id, episode, **kwargs: (
-                    "p{}".format(agent_id % 2)
-                ),
-            )
+        advantages = np.random.normal(size=(t,)).astype(np.float32)
+        value_targets = np.random.normal(size=(t,)).astype(np.float32)
+
+        costs = (mean_cost * np.ones((t,), dtype=np.float32))
+        cost_advantages = np.random.normal(size=(t,)).astype(np.float32)
+        cost_value_targets = np.random.normal(size=(t,)).astype(np.float32)
+
+        batch = SampleBatch(
+            {
+                Columns.OBS: obs,
+                Columns.NEXT_OBS: next_obs,
+                Columns.ACTIONS: actions,
+                Columns.REWARDS: rewards,
+                Columns.TERMINATEDS: terminateds,
+                Columns.TRUNCATEDS: truncateds,
+                Columns.ACTION_DIST_INPUTS: action_dist_inputs,
+                Columns.ACTION_LOGP: action_logp,
+                Postprocessing.ADVANTAGES: advantages,
+                Postprocessing.VALUE_TARGETS: value_targets,
+                Columns.EPS_ID: np.zeros((t,), dtype=np.int64),
+                "costs": costs,
+                "cost_advantages": cost_advantages,
+                "cost_value_targets": cost_value_targets,
+            }
         )
 
-        algo = config.build()
-        # Call train while results aren't returned because this is
-        # a asynchronous Algorithm and results are returned asynchronously.
-        curr_kl_coeff_1 = None
-        curr_kl_coeff_2 = None
-        while not curr_kl_coeff_1 or not curr_kl_coeff_2:
-            results = algo.train()
+        return MultiAgentBatch({DEFAULT_MODULE_ID: batch}, env_steps=t)
 
-            # Attempt to get the current KL coefficient from the learner.
-            # Iterate until we have found both coefficients at least once.
-            if "p0" in results[LEARNER_RESULTS]:
-                curr_kl_coeff_1 = results[LEARNER_RESULTS]["p0"][
-                    LEARNER_RESULTS_CURR_KL_COEFF_KEY
-                ]
-            if "p1" in results[LEARNER_RESULTS]:
-                curr_kl_coeff_2 = results[LEARNER_RESULTS]["p1"][
-                    LEARNER_RESULTS_CURR_KL_COEFF_KEY
-                ]
+    def test_build_adds_cost_gae_connector(self):
+        learner = self._build_local_learner(add_default_connectors=True)
+        connector_names = [type(c).__name__ for c in learner._learner_connector.connectors]
 
-        self.assertNotEqual(curr_kl_coeff_1, initial_kl_coeff)
-        self.assertNotEqual(curr_kl_coeff_2, initial_kl_coeff)
+        self.assertIn("AddOneTsToEpisodesAndTruncate", connector_names)
+        self.assertIn("GeneralAdvantageEstimation", connector_names)
+        self.assertIn("CostGeneralAdvantageEstimation", connector_names)
+
+        # Cost GAE should come after reward GAE in the pipeline.
+        self.assertGreater(
+            connector_names.index("CostGeneralAdvantageEstimation"),
+            connector_names.index("GeneralAdvantageEstimation"),
+        )
+
+    def test_lambda_updates_and_metrics_logged(self):
+        learner = self._build_local_learner(add_default_connectors=False)
+
+        module = learner.module[DEFAULT_MODULE_ID].unwrapped()
+        initial_lambda = float(module.get_lambda().detach().cpu().numpy())
+
+        mab = self._make_synthetic_mab(t=16, mean_cost=10.0)
+
+        # Make lambda update more visible.
+        learner.config.cost_limit = 5.0
+        learner.config.lambda_lr = 0.5
+
+        results = learner.update(batch=mab, num_epochs=1)
+
+        # Metrics must be present.
+        self.assertIn(DEFAULT_MODULE_ID, results)
+        self.assertIn("mean_cost", results[DEFAULT_MODULE_ID])
+        self.assertIn("lambda_value", results[DEFAULT_MODULE_ID])
+
+        # Lambda should increase because mean_cost > cost_limit.
+        new_lambda = float(module.get_lambda().detach().cpu().numpy())
+        self.assertGreater(new_lambda, initial_lambda)
+
+    def test_lambda_decreases_when_below_cost_limit(self):
+        learner = self._build_local_learner(add_default_connectors=False)
+        module = learner.module[DEFAULT_MODULE_ID].unwrapped()
+
+        initial_lambda = float(module.get_lambda().detach().cpu().numpy())
+
+        learner.config.cost_limit = 5.0
+        learner.config.lambda_lr = 1.0
+
+        mab = self._make_synthetic_mab(t=16, mean_cost=0.0)
+        learner.update(batch=mab, num_epochs=1)
+
+        new_lambda = float(module.get_lambda().detach().cpu().numpy())
+        self.assertLess(new_lambda, initial_lambda)
+
+    def test_lambda_optimizer_is_separate(self):
+        learner = self._build_local_learner(add_default_connectors=False)
+        module = learner.module[DEFAULT_MODULE_ID].unwrapped()
+
+        optimizers = dict(learner.get_optimizers_for_module(DEFAULT_MODULE_ID))
+        self.assertIn("default_optimizer", optimizers)
+        self.assertIn("lambda_optimizer", optimizers)
+
+        default_optim = optimizers["default_optimizer"]
+        lambda_optim = optimizers["lambda_optimizer"]
+
+        default_params = {
+            p
+            for g in default_optim.param_groups
+            for p in g.get("params", [])
+        }
+        lambda_params = {
+            p
+            for g in lambda_optim.param_groups
+            for p in g.get("params", [])
+        }
+
+        self.assertNotIn(module.lambda_param, default_params)
+        self.assertEqual(lambda_params, {module.lambda_param})
+
+    def test_state_restore_preserves_lambda(self):
+        learner1 = self._build_local_learner(add_default_connectors=False)
+        module1 = learner1.module[DEFAULT_MODULE_ID].unwrapped()
+
+        learner1.config.cost_limit = 5.0
+        learner1.config.lambda_lr = 0.5
+
+        mab = self._make_synthetic_mab(t=16, mean_cost=10.0)
+        learner1.update(batch=mab, num_epochs=1)
+
+        lambda_after_update = float(module1.get_lambda().detach().cpu().numpy())
+        state = learner1.get_state()
+
+        learner2 = self._build_local_learner(add_default_connectors=False)
+        module2 = learner2.module[DEFAULT_MODULE_ID].unwrapped()
+        learner2.set_state(state)
+
+        lambda_restored = float(module2.get_lambda().detach().cpu().numpy())
+        self.assertAlmostEqual(lambda_restored, lambda_after_update, places=6)
 
 
 if __name__ == "__main__":
