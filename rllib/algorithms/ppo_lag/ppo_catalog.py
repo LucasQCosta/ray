@@ -103,6 +103,18 @@ class PPOCatalog(Catalog):
             output_layer_dim=1,
         )
 
+        # Cost value function head config
+        self.cost_vf_head_config = MLPHeadConfig(
+            input_dims=self.latent_dims,
+            hidden_layer_dims=self.pi_and_vf_head_hiddens,
+            hidden_layer_activation=self.pi_and_vf_head_activation,
+            hidden_layer_use_layernorm=self._model_config_dict.get(
+                "head_fcnet_use_layernorm", False
+            ),
+            output_layer_activation="linear",
+            output_layer_dim=1,
+        )
+
     @OverrideToImplementCustomLogic
     def build_actor_critic_encoder(self, framework: str) -> ActorCriticEncoder:
         """Builds the ActorCriticEncoder.
