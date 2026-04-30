@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional
 
-from ray.rllib.algorithms.ppo.default_ppo_rl_module import DefaultPPORLModule
-from ray.rllib.algorithms.ppo.ppo_catalog import PPOCatalog
+from ray.rllib.algorithms.ppo_lag.default_ppo_rl_module import DefaultPPORLModule
+from ray.rllib.algorithms.ppo_lag.ppo_catalog import PPOCatalog
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.models.base import ACTOR, CRITIC, ENCODER_OUT
 from ray.rllib.core.rl_module.apis.value_function_api import ValueFunctionAPI
