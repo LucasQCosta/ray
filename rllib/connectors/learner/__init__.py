@@ -26,6 +26,9 @@ from ray.rllib.connectors.learner.compute_returns_to_go import ComputeReturnsToG
 from ray.rllib.connectors.learner.general_advantage_estimation import (
     GeneralAdvantageEstimation,
 )
+from ray.rllib.connectors.learner.general_cost_advantage_estimation import (
+    CostGeneralAdvantageEstimation,
+)
 from ray.rllib.connectors.learner.learner_connector_pipeline import (
     LearnerConnectorPipeline,
 )
@@ -41,6 +44,7 @@ __all__ = [
     "AgentToModuleMapping",
     "BatchIndividualItems",
     "ComputeReturnsToGo",
+    "CostGeneralAdvantageEstimation",
     "GeneralAdvantageEstimation",
     "LearnerConnectorPipeline",
     "NumpyToTensor",
