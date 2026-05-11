@@ -3,6 +3,10 @@ ray_env/
 
 # Temporary Scripts
 test.py
+run_ppo_lag_safe_cartpole.py
+
+# Local experiment outputs
+runs/
 
 #-----------------------------------------------
 
