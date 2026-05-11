@@ -8,6 +8,8 @@ from ray.rllib.algorithms.ppo.ppo import (
 )
 from ray.rllib.connectors.learner import (
     AddOneTsToEpisodesAndTruncate,
+    AddInfosFromEpisodesToTrainBatch,
+    AddCostsFromInfos,
     GeneralAdvantageEstimation,
     CostGeneralAdvantageEstimation
 )
@@ -60,6 +62,9 @@ class PPOLearner(Learner):
             self._learner_connector is not None
             and self.config.add_default_connectors_to_learner_pipeline
         ):
+            # We need infos in the train batch in order to extract per-timestep costs
+            # from e.g. `info["cost"]`.
+            self._learner_connector.prepend(AddInfosFromEpisodesToTrainBatch())
             # Before anything, add one ts to each episode (and record this in the loss
             # mask, so that the computations at this extra ts are not used to compute
             # the loss).
@@ -74,6 +79,10 @@ class PPOLearner(Learner):
                     gamma=self.config.gamma, lambda_=self.config.lambda_
                 )
             )
+
+            # Derive per-timestep `costs` from the infos column (defaults to
+            # `info["cost"]`, missing values -> 0.0).
+            self._learner_connector.append(AddCostsFromInfos())
 
             self._learner_connector.append(
                 CostGeneralAdvantageEstimation(
