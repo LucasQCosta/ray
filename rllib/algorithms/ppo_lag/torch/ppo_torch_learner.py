@@ -29,13 +29,25 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
     """Implements torch-specific PPO loss logic on top of PPOLearner.
 
     This class implements the ppo loss under `self.compute_loss_for_module()`.
+
+    PPO-Lag / Lagrangian PPO extensions implemented here:
+    - Maintain and update a dual variable (Lagrange multiplier) $\lambda \ge 0$.
+    - Learn an additional cost value function $V_c(s)$ (if present in the RLModule).
+    - Shape the policy advantage using cost advantages (primal objective).
+    - Update $\lambda$ using a separate optimizer (dual ascent/descent step).
     """
     @override(TorchLearner)
     def configure_optimizers_for_module(
         self, module_id: ModuleID, config: PPOConfig
     ) -> None:
-        # Register the default optimizer for all module parameters EXCEPT the
-        # Lagrangian multiplier parameter. We keep lambda updates separate.
+        # PPO-Lag uses a primal-dual update.
+        #
+        # Primal parameters (policy + value nets) are optimized with PPO's loss.
+        # The dual variable $\lambda$ is optimized separately from a dual objective
+        # derived from the constraint violation (see `lambda_loss` below).
+        #
+        # We therefore keep `lambda_param` OUT of the default optimizer and give it
+        # its own optimizer with its own learning rate (`lambda_lr`).
         module = self._module[module_id]
         params = [
             p
@@ -52,6 +64,7 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
 
         lag_module = self.module[module_id].unwrapped()
         lambda_lr = getattr(config, "lambda_lr", 0.05)
+        # Dual optimizer for the Lagrange multiplier parameter $\lambda$.
         lambda_optimizer = torch.optim.Adam([lag_module.lambda_param], lr=lambda_lr)
         self.register_optimizer(
             module_id=module_id,
@@ -80,20 +93,38 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
         # simplify the actual computation.
         if Columns.LOSS_MASK in batch:
             mask = batch[Columns.LOSS_MASK]
+            mask = mask if torch.is_tensor(mask) else torch.as_tensor(mask)
+            mask = mask.bool()
             num_valid = torch.sum(mask)
 
             def possibly_masked_mean(data_):
-                return torch.sum(data_[mask]) / num_valid
+                data_ = data_ if torch.is_tensor(data_) else torch.as_tensor(data_)
+                mask_ = mask.to(device=data_.device)
+                num_valid_ = num_valid.to(device=data_.device)
+                if num_valid_.item() == 0:
+                    return torch.mean(data_)
+                return torch.sum(data_[mask_]) / num_valid_
 
         else:
-            possibly_masked_mean = torch.mean
+            def possibly_masked_mean(data_):
+                data_ = data_ if torch.is_tensor(data_) else torch.as_tensor(data_)
+                return torch.mean(data_)
 
+        # Current dual variable value $\lambda$ (constrained to be non-negative
+        # by the RLModule's parameterization, e.g. softplus).
         current_lambda = module.get_lambda()
         
         if "cost_advantages" in batch:
             adv_r = batch[Postprocessing.ADVANTAGES]
             adv_c = batch["cost_advantages"]
             
+            # PPO-Lag shapes the reward advantage with a cost advantage term.
+            #
+            # One practical variant used here is:
+            # $$\tilde{A} = \frac{A_r - \lambda A_c}{1 + \lambda}$$
+            #
+            # Important: we detach $\lambda$ so policy gradients do not flow through
+            # the dual update (the dual step is handled by `lambda_optimizer`).
             lambda_detached = current_lambda.detach()
             
             batch[Postprocessing.ADVANTAGES] = (adv_r - lambda_detached * adv_c) / (1.0 + lambda_detached)
@@ -132,7 +163,14 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
             * torch.clamp(logp_ratio, 1 - config.clip_param, 1 + config.clip_param),
         )
 
-        # Compute a value function loss.
+        # Compute value function losses.
+        # Reward critic:
+        # $$L_V = \mathrm{MSE}(V(s_t), \hat{V}_t)$$
+        # and RLlib clips the per-sample squared error by `vf_clip_param` before
+        # averaging (this is why `vf_loss` often saturates near that clip value).
+        #
+        # Cost critic (if available):
+        # $$L_{V_c} = \mathrm{MSE}(V_c(s_t), \hat{V}^c_t)$$
         if config.use_critic:
             value_fn_out = module.compute_values(
                 batch, embeddings=fwd_out.get(Columns.EMBEDDINGS)
@@ -170,6 +208,15 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
         if mean_cost_vf_loss is not None:
             total_loss = total_loss + config.vf_loss_coeff * mean_cost_vf_loss
 
+        # Always log the cost value loss (0.0 if not applicable).
+        self.metrics.log_value(
+            (module_id, "cost_vf_loss"),
+            float(mean_cost_vf_loss.item())
+            if torch.is_tensor(mean_cost_vf_loss)
+            else float(mean_cost_vf_loss),
+            window=1,
+        )
+
         # Add mean_kl_loss (already processed through `possibly_masked_mean`),
         # if necessary.
         if config.use_kl_loss:
@@ -179,12 +226,24 @@ class PPOTorchLearner(PPOLearner, TorchLearner):
             mean_cost = possibly_masked_mean(batch["costs"])
             cost_limit = getattr(config, "cost_limit", 25.0)
             
+            # Dual objective term: encourage $\lambda$ to increase when the
+            # expected cost exceeds the limit, and decrease otherwise.
+            #
+            # Using the batch estimate $\mathbb{E}[C] \approx \text{mean\_cost}$:
+            # $$L_\lambda = -\lambda\,(\mathbb{E}[C] - C_{limit})$$
+            #
+            # Since $\lambda$ is optimized by `lambda_optimizer`, this produces the
+            # desired primal-dual behavior in practice.
             lambda_loss = -current_lambda * (mean_cost - cost_limit)
             
             total_loss = total_loss + lambda_loss
             
             self.metrics.log_value((module_id, "mean_cost"), mean_cost.item(), window=1)
             self.metrics.log_value((module_id, "lambda_value"), current_lambda.item(), window=1)
+            self.metrics.log_value((module_id, "lambda_loss"), lambda_loss.item(), window=1)
+
+        # Log total loss as a scalar for easier debugging/visualization.
+        self.metrics.log_value((module_id, "total_loss"), total_loss.item(), window=1)
 
         # Log important loss stats.
         self.metrics.log_dict(
