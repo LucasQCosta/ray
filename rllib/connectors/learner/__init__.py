@@ -16,6 +16,7 @@ from ray.rllib.connectors.learner.add_columns_from_episodes_to_train_batch impor
 from ray.rllib.connectors.learner.add_infos_from_episodes_to_train_batch import (
     AddInfosFromEpisodesToTrainBatch,
 )
+from ray.rllib.connectors.learner.add_costs_from_infos import AddCostsFromInfos
 from ray.rllib.connectors.learner.add_next_observations_from_episodes_to_train_batch import (  # noqa
     AddNextObservationsFromEpisodesToTrainBatch,
 )
@@ -35,6 +36,7 @@ from ray.rllib.connectors.learner.learner_connector_pipeline import (
 
 __all__ = [
     "AddColumnsFromEpisodesToTrainBatch",
+    "AddCostsFromInfos",
     "AddInfosFromEpisodesToTrainBatch",
     "AddNextObservationsFromEpisodesToTrainBatch",
     "AddObservationsFromEpisodesToBatch",
