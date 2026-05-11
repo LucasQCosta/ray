@@ -99,13 +99,27 @@ class TestPPOLagLearner(unittest.TestCase):
         connector_names = [type(c).__name__ for c in learner._learner_connector.connectors]
 
         self.assertIn("AddOneTsToEpisodesAndTruncate", connector_names)
+        self.assertIn("AddInfosFromEpisodesToTrainBatch", connector_names)
+        self.assertIn("AddCostsFromInfos", connector_names)
         self.assertIn("GeneralAdvantageEstimation", connector_names)
         self.assertIn("CostGeneralAdvantageEstimation", connector_names)
+
+        # Need infos before we can derive costs from them.
+        self.assertLess(
+            connector_names.index("AddInfosFromEpisodesToTrainBatch"),
+            connector_names.index("AddCostsFromInfos"),
+        )
 
         # Cost GAE should come after reward GAE in the pipeline.
         self.assertGreater(
             connector_names.index("CostGeneralAdvantageEstimation"),
             connector_names.index("GeneralAdvantageEstimation"),
+        )
+
+        # Costs must be derived before cost GAE runs.
+        self.assertLess(
+            connector_names.index("AddCostsFromInfos"),
+            connector_names.index("CostGeneralAdvantageEstimation"),
         )
 
     def test_lambda_updates_and_metrics_logged(self):
