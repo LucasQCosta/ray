@@ -4,6 +4,7 @@ ray_env/
 # Temporary Scripts
 test.py
 run_ppo_lag_safe_cartpole.py
+test_env/
 
 # Local experiment outputs
 runs/
