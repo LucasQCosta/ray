@@ -6,8 +6,8 @@ import numpy as np
 import tree
 
 import ray
-from ray.rllib.algorithms.ppo.ppo_catalog import PPOCatalog
-from ray.rllib.algorithms.ppo.torch.default_ppo_torch_rl_module import (
+from ray.rllib.algorithms.ppo_lag.ppo_lag_catalog import PPOCatalog
+from ray.rllib.algorithms.ppo_lag.torch.default_ppo_lag_torch_rl_module import (
     DefaultPPOTorchRLModule,
 )
 from ray.rllib.core.columns import Columns

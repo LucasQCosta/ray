@@ -157,7 +157,7 @@ class PPOConfig(AlgorithmConfig):
     @override(AlgorithmConfig)
     def get_default_rl_module_spec(self) -> RLModuleSpec:
         if self.framework_str == "torch":
-            from ray.rllib.algorithms.ppo_lag.torch.default_ppo_torch_rl_module import (
+            from ray.rllib.algorithms.ppo_lag.torch.default_ppo_lag_torch_rl_module import (
                 DefaultPPOTorchRLModule,
             )
 
@@ -171,7 +171,7 @@ class PPOConfig(AlgorithmConfig):
     @override(AlgorithmConfig)
     def get_default_learner_class(self) -> Union[Type["Learner"], str]:
         if self.framework_str == "torch":
-            from ray.rllib.algorithms.ppo_lag.torch.ppo_torch_learner import (
+            from ray.rllib.algorithms.ppo_lag.torch.ppo_lag_torch_learner import (
                 PPOTorchLearner,
             )
 

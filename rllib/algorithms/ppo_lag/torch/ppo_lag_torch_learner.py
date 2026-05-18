@@ -3,14 +3,14 @@ from typing import Any, Dict
 
 import numpy as np
 
-from ray.rllib.algorithms.ppo.ppo import (
+from ray.rllib.algorithms.ppo_lag.ppo_lag import (
     LEARNER_RESULTS_CURR_KL_COEFF_KEY,
     LEARNER_RESULTS_KL_KEY,
     LEARNER_RESULTS_VF_EXPLAINED_VAR_KEY,
     LEARNER_RESULTS_VF_LOSS_UNCLIPPED_KEY,
     PPOConfig,
 )
-from ray.rllib.algorithms.ppo_lag.ppo_learner import PPOLearner
+from ray.rllib.algorithms.ppo_lag.ppo_lag_learner import PPOLearner
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.learner.learner import ENTROPY_KEY, POLICY_LOSS_KEY, VF_LOSS_KEY
 from ray.rllib.core.learner.torch.torch_learner import TorchLearner

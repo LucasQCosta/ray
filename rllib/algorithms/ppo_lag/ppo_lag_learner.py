@@ -1,7 +1,7 @@
 import abc
 from typing import Any, Dict
 
-from ray.rllib.algorithms.ppo.ppo import (
+from ray.rllib.algorithms.ppo_lag.ppo_lag import (
     LEARNER_RESULTS_CURR_ENTROPY_COEFF_KEY,
     LEARNER_RESULTS_KL_KEY,
     PPOConfig,
