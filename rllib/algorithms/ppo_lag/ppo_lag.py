@@ -1,17 +1,26 @@
 """
-Proximal Policy Optimization (PPO)
-==================================
+Proximal Policy Optimization with Lagrangian Constraints (PPO-Lag)
+=================================================================
 
-This file defines the distributed Algorithm class for proximal policy
-optimization.
-See `ppo_[tf|torch]_policy.py` for the definition of the policy loss.
+This file defines the distributed Algorithm class and configuration for
+PPO-Lag.
 
-Detailed documentation: https://docs.ray.io/en/master/rllib-algorithms.html#ppo
+On the old RLlib API stack, the policy loss and Lagrange multiplier update are
+implemented in `ppo_lag_torch_policy.py` or `ppo_lag_tf_policy.py`.
+
+On the new RLlib API stack, the RLModule/Learner implementation is provided by
+the files under `ppo_lag/torch/` and the corresponding RLModule/Catalog files.
+
+For the current project, the old API stack is used through:
+
+    config.api_stack(
+        enable_rl_module_and_learner=False,
+        enable_env_runner_and_connector_v2=False,
+    )
 """
-
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
-
+import numpy as np
 from typing_extensions import Self
 
 from ray._common.deprecation import DEPRECATED_VALUE
@@ -52,7 +61,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
+COSTS = "costs"
+COST_ADVANTAGES = "cost_advantages"
+BATCH_MEAN_COST = "batch_mean_cost"
+CONSTRAINT_LAMBDA = "constraint_lambda"
 LEARNER_RESULTS_VF_LOSS_UNCLIPPED_KEY = "vf_loss_unclipped"
 LEARNER_RESULTS_VF_EXPLAINED_VAR_KEY = "vf_explained_var"
 LEARNER_RESULTS_KL_KEY = "mean_kl_loss"
@@ -61,7 +73,7 @@ LEARNER_RESULTS_CURR_ENTROPY_COEFF_KEY = "curr_entropy_coeff"
 
 
 class PPOConfig(AlgorithmConfig):
-    """Defines a configuration class from which a PPO Algorithm can be built.
+    """Defines a configuration class from which a PPO-Lag Algorithm can be built.
 
     .. testcode::
 
@@ -140,6 +152,28 @@ class PPOConfig(AlgorithmConfig):
         self.clip_param = 0.3
         self.vf_clip_param = 10.0
         self.grad_clip = None
+        self.cost_key = "cost"
+
+        # Constraint threshold. The Lagrange multiplier increases when
+        # mean_cost > cost_limit and decreases otherwise.
+        self.cost_limit = 25.0
+
+        # Learning rate for the Lagrange multiplier.
+        self.lambda_lr = 0.05
+
+        # Initial and maximum value for the Lagrange multiplier.
+        self.lambda_init = 0.0
+        self.lambda_max = 1
+
+        # Discount and GAE lambda for the cost-return estimator.
+        self.cost_gamma = 0.99
+        self.cost_lambda = 0.95
+
+        # If the model implements a cost critic, this weights its loss.
+        self.cost_vf_loss_coeff = 1.0
+
+        # Normalizes the Lagrangian advantage by (1 + lambda).
+        self.normalize_lagrangian_advantage = True
 
         # Override some of AlgorithmConfig's default values with PPO-specific values.
         self.num_env_runners = 2
@@ -203,6 +237,15 @@ class PPOConfig(AlgorithmConfig):
         clip_param: Optional[float] = NotProvided,
         vf_clip_param: Optional[float] = NotProvided,
         grad_clip: Optional[float] = NotProvided,
+        cost_key: Optional[str] = NotProvided,
+        cost_limit: Optional[float] = NotProvided,
+        lambda_lr: Optional[float] = NotProvided,
+        lambda_init: Optional[float] = NotProvided,
+        lambda_max: Optional[float] = NotProvided,
+        cost_gamma: Optional[float] = NotProvided,
+        cost_lambda: Optional[float] = NotProvided,
+        cost_vf_loss_coeff: Optional[float] = NotProvided,
+        normalize_lagrangian_advantage: Optional[bool] = NotProvided,
         # @OldAPIStack
         lr_schedule: Optional[List[List[Union[int, float]]]] = NotProvided,
         # Deprecated.
@@ -272,6 +315,24 @@ class PPOConfig(AlgorithmConfig):
             self.vf_clip_param = vf_clip_param
         if grad_clip is not NotProvided:
             self.grad_clip = grad_clip
+        if cost_key is not NotProvided:
+            self.cost_key = cost_key
+        if cost_limit is not NotProvided:
+            self.cost_limit = cost_limit
+        if lambda_lr is not NotProvided:
+            self.lambda_lr = lambda_lr
+        if lambda_init is not NotProvided:
+            self.lambda_init = lambda_init
+        if lambda_max is not NotProvided:
+            self.lambda_max = lambda_max
+        if cost_gamma is not NotProvided:
+            self.cost_gamma = cost_gamma
+        if cost_lambda is not NotProvided:
+            self.cost_lambda = cost_lambda
+        if cost_vf_loss_coeff is not NotProvided:
+            self.cost_vf_loss_coeff = cost_vf_loss_coeff
+        if normalize_lagrangian_advantage is not NotProvided:
+            self.normalize_lagrangian_advantage = normalize_lagrangian_advantage
 
         # TODO (sven): Remove these once new API stack is only option for PPO.
         if lr_schedule is not NotProvided:
@@ -356,6 +417,56 @@ class PPOConfig(AlgorithmConfig):
         if isinstance(self.entropy_coeff, float) and self.entropy_coeff < 0.0:
             self._value_error("`entropy_coeff` must be >= 0.0")
 
+        # PPO-Lag parameter validation.
+        if not np.isfinite(self.cost_limit):
+            self._value_error(
+                "`cost_limit` must be finite."
+            )
+
+        if not np.isfinite(self.lambda_lr) or self.lambda_lr < 0.0:
+            self._value_error(
+                "`lambda_lr` must be finite and >= 0.0."
+            )
+
+        if not np.isfinite(self.lambda_init) or self.lambda_init < 0.0:
+            self._value_error(
+                "`lambda_init` must be finite and >= 0.0."
+            )
+
+        if not np.isfinite(self.lambda_max) or self.lambda_max <= 0.0:
+            self._value_error(
+                "`lambda_max` must be finite and > 0.0."
+            )
+
+        if self.lambda_init > self.lambda_max:
+            self._value_error(
+                "`lambda_init` must be <= `lambda_max`."
+            )
+
+        if (
+            not np.isfinite(self.cost_gamma)
+            or not 0.0 <= self.cost_gamma <= 1.0
+        ):
+            self._value_error(
+                "`cost_gamma` must be finite and between 0.0 and 1.0."
+            )
+
+        if (
+            not np.isfinite(self.cost_lambda)
+            or not 0.0 <= self.cost_lambda <= 1.0
+        ):
+            self._value_error(
+                "`cost_lambda` must be finite and between 0.0 and 1.0."
+            )
+
+        if (
+            not np.isfinite(self.cost_vf_loss_coeff)
+            or self.cost_vf_loss_coeff < 0.0
+        ):
+            self._value_error(
+                "`cost_vf_loss_coeff` must be finite and >= 0.0."
+            )
+
     @property
     @override(AlgorithmConfig)
     def _model_config_auto_includes(self) -> Dict[str, Any]:
@@ -375,7 +486,7 @@ class PPO(Algorithm):
     ) -> Optional[Type[Policy]]:
         if config["framework"] == "torch":
 
-            from ray.rllib.algorithms.ppo.ppo_torch_policy import PPOTorchPolicy
+            from ray.rllib.algorithms.ppo_lag.ppo_lag_torch_policy import PPOTorchPolicy
 
             return PPOTorchPolicy
         elif config["framework"] == "tf":
@@ -470,6 +581,75 @@ class PPO(Algorithm):
             )
 
     @OldAPIStack
+    def _update_lagrange_multipliers(
+        self,
+        train_batch,
+    ) -> Dict[str, Dict[str, float]]:
+        """Update one Lagrange multiplier per policy using the full batch."""
+
+        lagrange_stats = {}
+
+        for policy_id, policy_batch in train_batch.policy_batches.items():
+            if COSTS not in policy_batch:
+                logger.warning(
+                    "Policy %s does not contain the '%s' field. "
+                    "Skipping Lagrange multiplier update.",
+                    policy_id,
+                    COSTS,
+                )
+                continue
+
+            costs = np.asarray(
+                policy_batch[COSTS],
+                dtype=np.float32,
+            ).reshape(-1)
+
+            if costs.size == 0:
+                logger.warning(
+                    "Policy %s received an empty cost batch.",
+                    policy_id,
+                )
+                continue
+
+            if not np.all(np.isfinite(costs)):
+                invalid_costs = costs[~np.isfinite(costs)]
+
+                raise ValueError(
+                    f"Policy {policy_id} contains non-finite costs: "
+                    f"{invalid_costs[:10]}"
+                )
+
+            # Mean cost over the complete policy batch.
+            # observed_cost is the mean cost per agent transition.
+            observed_cost = float(np.mean(costs))
+
+            policy = self.get_policy(policy_id)
+
+            if policy is None:
+                raise RuntimeError(
+                    f"Could not find local policy '{policy_id}'."
+                )
+
+            if not hasattr(policy, "update_lagrange_multiplier"):
+                logger.debug(
+                    "Skipping Lagrange update for policy '%s': "
+                    "policy has no update_lagrange_multiplier().",
+                    policy_id,
+                )
+                continue
+
+            new_lambda = policy.update_lagrange_multiplier(
+                observed_cost
+            )
+
+            lagrange_stats[policy_id] = {
+                BATCH_MEAN_COST: observed_cost,
+                CONSTRAINT_LAMBDA: new_lambda,
+            }
+
+        return lagrange_stats
+
+    @OldAPIStack
     def _training_step_old_api_stack(self) -> ResultDict:
         # Collect batches from sample workers until we have a full batch.
         with self._timers[SAMPLE_TIMER]:
@@ -488,16 +668,58 @@ class PPO(Algorithm):
             # Return early if all our workers failed.
             if not train_batch:
                 return {}
-            train_batch = train_batch.as_multi_agent()
-            self._counters[NUM_AGENT_STEPS_SAMPLED] += train_batch.agent_steps()
-            self._counters[NUM_ENV_STEPS_SAMPLED] += train_batch.env_steps()
-            # Standardize advantages.
-            train_batch = standardize_fields(train_batch, ["advantages"])
+        train_batch = train_batch.as_multi_agent()
+
+        self._counters[NUM_AGENT_STEPS_SAMPLED] += (
+            train_batch.agent_steps()
+        )
+        self._counters[NUM_ENV_STEPS_SAMPLED] += (
+            train_batch.env_steps()
+        )
+
+        # Update lambda once using the complete collected batch.
+        # This must happen before PPO divides the batch into minibatches.
+        lagrange_stats = self._update_lagrange_multipliers(
+            train_batch
+        )
+
+        # Standardize policy and cost advantages.
+        train_batch = standardize_fields(
+            train_batch,
+            [
+                "advantages",
+                COST_ADVANTAGES,
+            ],
+        )
 
         if self.config.simple_optimizer:
-            train_results = train_one_step(self, train_batch)
+            train_results = train_one_step(
+                self,
+                train_batch,
+            )
         else:
-            train_results = multi_gpu_train_one_step(self, train_batch)
+            train_results = multi_gpu_train_one_step(
+                self,
+                train_batch,
+            )
+
+        # Add the exact full-batch cost and lambda used in this iteration
+        # to the learner metrics.
+        for policy_id, stats in lagrange_stats.items():
+            if policy_id not in train_results:
+                continue
+
+            learner_stats = train_results[policy_id].setdefault(
+                LEARNER_STATS_KEY,
+                {},
+            )
+
+            learner_stats[BATCH_MEAN_COST] = stats[
+                BATCH_MEAN_COST
+            ]
+            learner_stats[CONSTRAINT_LAMBDA] = stats[
+                CONSTRAINT_LAMBDA
+            ]
 
         policies_to_update = list(train_results.keys())
 
